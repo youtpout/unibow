@@ -89,7 +89,7 @@ contract Unibow is BaseHook {
 
     modifier onlyOwner() { require(msg.sender == owner, "owner"); _; }
 
-    constructor(IPoolManager _pm, uint256 _feeBorrowBP, uint256 _feeClassicBP, uint256 _feeRebalBP) BaseHook(_pm) {
+    constructor(IPoolManager _pm) BaseHook(_pm) {
         owner = msg.sender;
         feeBorrowBP = 30000;
         feeClassicBP = 3000;
