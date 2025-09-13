@@ -91,9 +91,9 @@ contract Unibow is BaseHook {
 
     constructor(IPoolManager _pm, uint256 _feeBorrowBP, uint256 _feeClassicBP, uint256 _feeRebalBP) BaseHook(_pm) {
         owner = msg.sender;
-        feeBorrowBP = _feeBorrowBP;
-        feeClassicBP = _feeClassicBP;
-        feeRebalBP = _feeRebalBP;
+        feeBorrowBP = 30000;
+        feeClassicBP = 3000;
+        feeRebalBP = 500;
 
         borrowableRatioBP = 8000; // 80%
         lpLockMonths = 3;
@@ -191,7 +191,7 @@ contract Unibow is BaseHook {
     }
 
     // ---------------- Hooks -----------------
-
+   
     function _beforeAddLiquidity(address sender, PoolKey calldata key, ModifyLiquidityParams calldata params, bytes calldata)
         internal override returns (bytes4)
     {

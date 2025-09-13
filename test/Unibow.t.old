@@ -1,0 +1,151 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.26;
+
+import "forge-std/Test.sol";
+import "../src/Unibow.sol";
+import {IPoolManager, SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+
+contract MockPoolManager is IPoolManager {
+    function unlock(bytes calldata) external override {}
+}
+
+contract UnibowTest is Test {
+    Unibow public hook;
+    MockPoolManager public poolManager;
+    PoolKey public key;
+
+    address lp = address(0xAAA);
+    address borrower = address(0xBBB);
+
+    function setUp() public {
+        poolManager = new MockPoolManager();
+        hook = new Unibow(poolManager, 300, 30, 5);
+
+        key = PoolKey({
+            currency0: Currency.wrap(address(0x1111)),
+            currency1: Currency.wrap(address(0x2222)),
+            fee: 3000,
+            tickSpacing: 60,
+            hooks: address(hook)
+        });
+
+        // On initialise un peu de réserve
+        hook.setPoolReserve(key, 1_000_000 ether, 1_000_000 ether);
+    }
+
+    // 1) LP lock & rebalance
+    function testCannotRemoveBeforeUnlockAndCanRebalance() public {
+        ModifyLiquidityParams memory params =
+            ModifyLiquidityParams({
+                tickLower: -600,
+                tickUpper: 600,
+                liquidityDelta: 1000,
+                salt: bytes32("id1")
+            });
+
+        // LP ajoute de la liquidité
+        vm.prank(lp);
+        hook._beforeAddLiquidity(lp, key, params, "");
+
+        bytes32 pKey = keccak256(abi.encodePacked(lp, params.tickLower, params.tickUpper, params.salt));
+        (,, , uint256 unlock,,) = hook.lpPositions(key.toId(), pKey);
+        assertGt(unlock, block.timestamp);
+
+        // Tentative de retrait avant l'heure
+        vm.expectRevert("position locked");
+        vm.prank(lp);
+        hook._beforeRemoveLiquidity(lp, key, params, "");
+
+        // LP re-balance (ajoute à nouveau dans la même plage)
+        vm.prank(lp);
+        hook._beforeAddLiquidity(lp, key, params, "");
+        (,, , uint256 unlock2,,) = hook.lpPositions(key.toId(), pKey);
+        assertEq(unlock2, unlock + 1 days);
+    }
+
+    // 2) Loan avec plusieurs swaps puis remboursement
+    function testLoanWithMultipleSwapsAndRepay() public {
+        Unibow.BorrowData memory bd = Unibow.BorrowData({
+            isBorrow: true,
+            tokenIndex: 0,
+            durationSeconds: 0,
+            expectedOut: 500 ether
+        });
+
+        // Premier swap = création du prêt
+        hook._beforeSwap(
+            borrower, key,
+            SwapParams({zeroForOne:true, amountSpecified:int256(500 ether), sqrtPriceLimitX96:0}),
+            abi.encode(bd)
+        );
+
+        // Finalisation du premier swap
+        hook._afterSwap(
+            borrower, key,
+            SwapParams({zeroForOne:true, amountSpecified:int256(500 ether), sqrtPriceLimitX96:0}),
+            BalanceDelta.wrap(0),
+            abi.encode(true, uint8(0), uint256(500 ether))
+        );
+
+        // Faire un deuxième swap lié au même prêt
+        bd.expectedOut = 300 ether;
+        hook._beforeSwap(
+            borrower, key,
+            SwapParams({zeroForOne:true, amountSpecified:int256(300 ether), sqrtPriceLimitX96:0}),
+            abi.encode(bd)
+        );
+
+        hook._afterSwap(
+            borrower, key,
+            SwapParams({zeroForOne:true, amountSpecified:int256(300 ether), sqrtPriceLimitX96:0}),
+            BalanceDelta.wrap(0),
+            abi.encode(true, uint8(0), uint256(300 ether))
+        );
+
+        // Remboursement avant l’échéance
+        vm.prank(borrower);
+        hook.repayLoan(key, 1);
+
+        (, , , , , , , bool repaid, bool exists) = hook.loans(key.toId(), 1);
+        assertTrue(repaid);
+        assertTrue(exists);
+    }
+
+    // 3) Expiration et défaut
+    function testDefaultAfterExpiration() public {
+        Unibow.BorrowData memory bd = Unibow.BorrowData({
+            isBorrow: true,
+            tokenIndex: 1,
+            durationSeconds: 0,
+            expectedOut: 200 ether
+        });
+
+        // Création du prêt
+        hook._beforeSwap(
+            borrower, key,
+            SwapParams({zeroForOne:false, amountSpecified:int256(200 ether), sqrtPriceLimitX96:0}),
+            abi.encode(bd)
+        );
+
+        hook._afterSwap(
+            borrower, key,
+            SwapParams({zeroForOne:false, amountSpecified:int256(200 ether), sqrtPriceLimitX96:0}),
+            BalanceDelta.wrap(0),
+            abi.encode(true, uint8(1), uint256(200 ether))
+        );
+
+        // Avancer le temps au-delà de 60 jours
+        vm.warp(block.timestamp + 61 days);
+
+        // Le remboursement doit échouer
+        vm.expectRevert("repay window closed");
+        vm.prank(borrower);
+        hook.repayLoan(key, 1);
+
+        // L’owner peut marquer le défaut
+        hook.processDefault(key, 1);
+
+        (, , , , , , , bool repaid,) = hook.loans(key.toId(), 1);
+        assertFalse(repaid); // pas remboursé, donc défaut
+    }
+}
