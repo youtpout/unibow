@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-import {Test,console} from "forge-std/Test.sol";
+import {Test, console} from "forge-std/Test.sol";
 
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
@@ -15,7 +15,7 @@ import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {LiquidityAmounts} from "@uniswap/v4-core/test/utils/LiquidityAmounts.sol";
 import {IPositionManager} from "@uniswap/v4-periphery/src/interfaces/IPositionManager.sol";
 import {Constants} from "@uniswap/v4-core/test/utils/Constants.sol";
-
+import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
 
 import {EasyPosm} from "./utils/libraries/EasyPosm.sol";
 import {Deployers} from "./utils/Deployers.sol";
@@ -52,10 +52,9 @@ contract UnibowTest is Test, Deployers {
         // Déploiement du hook à une adresse avec flags Uniswap v4
         address flags = address(
             uint160(
-                Hooks.BEFORE_SWAP_FLAG
-                | Hooks.AFTER_SWAP_FLAG
-                | Hooks.BEFORE_ADD_LIQUIDITY_FLAG
-                | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG
+                Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+                    | Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG
+                    
             ) ^ (0x4444 << 144)
         );
 
@@ -64,7 +63,7 @@ contract UnibowTest is Test, Deployers {
         hook = Unibow(flags);
 
         // Création d'une pool
-        poolKey = PoolKey(currency0, currency1, 3000, 60, IHooks(hook));
+        poolKey = PoolKey(currency0, currency1, LPFeeLibrary.DYNAMIC_FEE_FLAG, 60, IHooks(hook));
         poolId = poolKey.toId();
         poolManager.initialize(poolKey, Constants.SQRT_PRICE_1_1);
 
@@ -98,15 +97,7 @@ contract UnibowTest is Test, Deployers {
         // Essaye de retirer immédiatement -> revert attendu
         vm.expectRevert("position locked");
         vm.prank(lp);
-        positionManager.decreaseLiquidity(
-            tokenId,
-            1e18,
-            0,
-            0,
-            lp,
-            block.timestamp,
-            Constants.ZERO_BYTES
-        );
+        positionManager.decreaseLiquidity(tokenId, 1e18, 0, 0, lp, block.timestamp, Constants.ZERO_BYTES);
 
         // LP rebalancing = ajoute encore de la liquidité
         uint128 addLiquidity = 50e18;
@@ -118,12 +109,7 @@ contract UnibowTest is Test, Deployers {
         );
 
         positionManager.increaseLiquidity(
-            tokenId,
-            addLiquidity,
-            amount0Expected + 1,
-            amount1Expected + 1,
-            block.timestamp,
-            Constants.ZERO_BYTES
+            tokenId, addLiquidity, amount0Expected + 1, amount1Expected + 1, block.timestamp, Constants.ZERO_BYTES
         );
 
         // On pourrait ici checker dans hook.lpPositions que unlockTimestamp est +1 day
@@ -137,12 +123,9 @@ contract UnibowTest is Test, Deployers {
             amountOutMin: 0,
             zeroForOne: true,
             poolKey: poolKey,
-            hookData: abi.encode(Unibow.BorrowData({
-                isBorrow: true,
-                tokenIndex: 0,
-                durationSeconds: 0,
-                expectedOut: amountIn
-            })),
+            hookData: abi.encode(
+                Unibow.BorrowData({isBorrow: true, tokenIndex: 0, durationSeconds: 0, expectedOut: amountIn})
+            ),
             receiver: borrower,
             deadline: block.timestamp + 1
         });
@@ -153,7 +136,7 @@ contract UnibowTest is Test, Deployers {
         vm.prank(borrower);
         hook.repayLoan(poolKey, 1);
 
-        (, , , , , , , bool repaid,) = hook.loans(poolId, 1);
+        (,,,,,,, bool repaid,) = hook.loans(poolId, 1);
         assertTrue(repaid);
     }
 
@@ -164,12 +147,9 @@ contract UnibowTest is Test, Deployers {
             amountOutMin: 0,
             zeroForOne: true,
             poolKey: poolKey,
-            hookData: abi.encode(Unibow.BorrowData({
-                isBorrow: true,
-                tokenIndex: 0,
-                durationSeconds: 0,
-                expectedOut: amountIn
-            })),
+            hookData: abi.encode(
+                Unibow.BorrowData({isBorrow: true, tokenIndex: 0, durationSeconds: 0, expectedOut: amountIn})
+            ),
             receiver: borrower,
             deadline: block.timestamp + 1
         });
@@ -181,8 +161,5 @@ contract UnibowTest is Test, Deployers {
         vm.expectRevert("repay window closed");
         vm.prank(borrower);
         hook.repayLoan(poolKey, 1);
-
-        // Owner traite le défaut
-        hook.processDefault(poolKey, 1);
     }
 }
