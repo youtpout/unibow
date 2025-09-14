@@ -114,6 +114,7 @@ contract Unibow is BaseHook {
 
     // encoded swap data for borrow
     struct BorrowData {
+        address borrower;
         bool isBorrow;
         uint8 tokenIndex; // 0 or 1
         uint256 durationSeconds; // optional override for repay window
@@ -194,6 +195,8 @@ contract Unibow is BaseHook {
         BorrowData memory bd;
         if (data.length > 0) bd = abi.decode(data, (BorrowData));
 
+        require(bd.borrower != address(0), "borrower required in data");
+
         uint24 fee = _getFee(bd.isBorrow, false) | LPFeeLibrary.OVERRIDE_FEE_FLAG;
 
         if (!bd.isBorrow) {
@@ -207,7 +210,7 @@ contract Unibow is BaseHook {
         // register loan placeholder; actual amounts will be filled in afterSwap when we know the real out amount
         uint256 loanId = ++nextLoanId[pid];
         loans[pid][loanId] = LoanEscrow({
-            borrower: tx.origin,
+            borrower: bd.borrower,
             tokenIndex: tokenIndex,
             amountBorrowed: 0,
             L_add_amount0: 0,

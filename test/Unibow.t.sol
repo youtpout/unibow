@@ -124,7 +124,7 @@ contract UnibowTest is Test, Deployers {
             zeroForOne: true,
             poolKey: poolKey,
             hookData: abi.encode(
-                Unibow.BorrowData({isBorrow: true, tokenIndex: 0, durationSeconds: 0, expectedOut: amountIn})
+                Unibow.BorrowData({borrower:borrower, isBorrow: true, tokenIndex: 0, durationSeconds: 0, expectedOut: amountIn})
             ),
             receiver: borrower,
             deadline: block.timestamp + 1
@@ -148,7 +148,7 @@ contract UnibowTest is Test, Deployers {
             zeroForOne: true,
             poolKey: poolKey,
             hookData: abi.encode(
-                Unibow.BorrowData({isBorrow: true, tokenIndex: 0, durationSeconds: 0, expectedOut: amountIn})
+                Unibow.BorrowData({borrower:borrower, isBorrow: true, tokenIndex: 0, durationSeconds: 0, expectedOut: amountIn})
             ),
             receiver: borrower,
             deadline: block.timestamp + 1
