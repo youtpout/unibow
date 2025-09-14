@@ -32,6 +32,8 @@ import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmo
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 
+import {Constants} from "@uniswap/v4-core/test/utils/Constants.sol";
+
 contract Unibow is BaseHook {
     using PoolIdLibrary for PoolKey;
 
@@ -54,8 +56,6 @@ contract Unibow is BaseHook {
     // bookkeeping
     struct LPPosition {
         address owner;
-        uint256 amount0; // token0 amount at deposit (estimate)
-        uint256 amount1; // token1 amount at deposit (estimate)
         uint256 unlockTimestamp;
         bool exists;
     }
@@ -149,29 +149,18 @@ contract Unibow is BaseHook {
         PoolKey calldata key,
         ModifyLiquidityParams calldata params,
         bytes calldata
-    ) internal override returns (bytes4) {
+    ) internal override returns (bytes4) {        
         PoolId pid = key.toId();
-        require(params.liquidityDelta > 0, "liquidityDelta must be positive for add");
-
-        // read price & bounds
-        (uint160 sqrtPriceX96,,,) = StateLibrary.getSlot0(poolManager, pid);
-
-        (uint256 amount0, uint256 amount1) =
-            getAmountsForLiquidity(params.tickLower, params.tickUpper, params.liquidityDelta, sqrtPriceX96);
-
+        require(params.liquidityDelta > 0, "liquidityDelta must be positive for add");        
         bytes32 pKey = _posKey(sender, params.tickLower, params.tickUpper, params.salt);
         LPPosition storage info = lpPositions[pid][pKey];
         uint256 baseLock = lpLockTime;
         if (info.exists) {
             // rebalance: extend lock +1 day and accumulate amounts
             info.unlockTimestamp = info.unlockTimestamp + 1 days;
-            info.amount0 += amount0;
-            info.amount1 += amount1;
         } else {
             info.exists = true;
             info.owner = sender;
-            info.amount0 = amount0;
-            info.amount1 = amount1;
             info.unlockTimestamp = block.timestamp + baseLock;
         }
 
