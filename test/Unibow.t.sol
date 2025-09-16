@@ -21,6 +21,7 @@ import {EasyPosm} from "./utils/libraries/EasyPosm.sol";
 import {Deployers} from "./utils/Deployers.sol";
 
 import {Unibow} from "../src/Unibow.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 contract UnibowTest is Test, Deployers {
     using EasyPosm for IPositionManager;
@@ -54,7 +55,6 @@ contract UnibowTest is Test, Deployers {
             uint160(
                 Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
                     | Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG
-                    
             ) ^ (0x4444 << 144)
         );
 
@@ -79,18 +79,33 @@ contract UnibowTest is Test, Deployers {
             liquidityAmount
         );
 
-        (tokenId,) = positionManager.mint(
+        IERC20( Currency.unwrap(currency0)).approve(address(hook), type(uint256).max);
+        IERC20( Currency.unwrap(currency1)).approve(address(hook), type(uint256).max);
+        (tokenId,) = hook.addLiquidity(
             poolKey,
             tickLower,
             tickUpper,
-            liquidityAmount,
-            amount0Expected + 1,
-            amount1Expected + 1,
-            lp,
-            block.timestamp,
-            Constants.ZERO_BYTES
+            100e18,
+            150e18,
+            lp           
         );
     }
+
+    function testMintFails() public {
+        vm.expectRevert();
+        positionManager.mint(
+            poolKey,
+            -120,
+            120,
+            1e18,
+            type(uint256).max,
+            type(uint256).max,
+            address(this),
+            block.timestamp,
+            ""
+        );
+    }
+
 
     function testLpCannotWithdrawBeforeUnlockButCanRebalance() public {
         // LP a une position active (créée dans setUp)
@@ -120,11 +135,17 @@ contract UnibowTest is Test, Deployers {
         uint256 amountIn = 100e18;
         BalanceDelta swapDelta = swapRouter.swapExactTokensForTokens({
             amountIn: amountIn,
-            amountOutMin: 0,
+            amountOutMin: 1,
             zeroForOne: true,
             poolKey: poolKey,
             hookData: abi.encode(
-                Unibow.BorrowData({borrower:borrower, isBorrow: true, tokenIndex: 0, durationSeconds: 0, expectedOut: amountIn})
+                Unibow.BorrowData({
+                    borrower: borrower,
+                    isBorrow: true,
+                    tokenIndex: 0,
+                    durationSeconds: 0,
+                    expectedOut: amountIn
+                })
             ),
             receiver: borrower,
             deadline: block.timestamp + 1
@@ -144,11 +165,17 @@ contract UnibowTest is Test, Deployers {
         uint256 amountIn = 50e18;
         swapRouter.swapExactTokensForTokens({
             amountIn: amountIn,
-            amountOutMin: 0,
+            amountOutMin: 1,
             zeroForOne: true,
             poolKey: poolKey,
             hookData: abi.encode(
-                Unibow.BorrowData({borrower:borrower, isBorrow: true, tokenIndex: 0, durationSeconds: 0, expectedOut: amountIn})
+                Unibow.BorrowData({
+                    borrower: borrower,
+                    isBorrow: true,
+                    tokenIndex: 0,
+                    durationSeconds: 0,
+                    expectedOut: amountIn
+                })
             ),
             receiver: borrower,
             deadline: block.timestamp + 1

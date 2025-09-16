@@ -33,11 +33,18 @@ import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 
 import {Constants} from "@uniswap/v4-core/test/utils/Constants.sol";
+import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
+import {Base64} from "@openzeppelin/contracts/utils/Base64.sol";
+import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 
-contract Unibow is BaseHook {
+contract Unibow is BaseHook, ERC721 {
     using PoolIdLibrary for PoolKey;
+    using Strings for uint256;
 
     uint256 public constant BASIS = 10_000; // bps scale
+
+    // For visual scaling of liquidity bar in SVG
+    uint256 public constant VISUAL_LIQUIDITY_CAP = 1e18; // cap used to scale the bar width
 
     // fees in bps (set at construction)
     uint24 public feeBorrowBP = 30_000; //   3%
@@ -52,13 +59,17 @@ contract Unibow is BaseHook {
     // safety
     uint256 public triggerRation = 100_000; // if loan > 10% of liquidity, borrow ratio is reduced
     uint256 public ratioByPercent = 30_000; // 3%
-
-    // bookkeeping
     struct LPPosition {
-        address owner;
-        uint256 unlockTimestamp;
+        PoolKey key;
+        int24 tickLower;
+        int24 tickUpper;
+        uint128 liquidity;
+        uint256 unlockTime;
         bool exists;
     }
+
+    mapping(uint256 => LPPosition) public positions;
+    uint256 public nextId;
 
     // loan escrow
     struct LoanEscrow {
@@ -73,10 +84,6 @@ contract Unibow is BaseHook {
         bool exists;
     }
 
-    // pool => positionKey => LPPosition
-    mapping(PoolId => mapping(bytes32 => LPPosition)) public lpPositions;
-    mapping(PoolId => uint256) public nextLPPositionId; // optional indexing
-
     // pool => loanId => LoanEscrow
     mapping(PoolId => mapping(uint256 => LoanEscrow)) public loans;
     mapping(PoolId => uint256) public nextLoanId;
@@ -90,7 +97,11 @@ contract Unibow is BaseHook {
 
     address public owner;
 
-    constructor(IPoolManager _pm) BaseHook(_pm) {}
+    error PoolNotInitialized();
+    error SenderMustBeHook();
+
+
+    constructor(IPoolManager _pm) BaseHook(_pm) ERC721("Unibow LP", "UBLP") {}
 
     // hook permissions
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
@@ -132,39 +143,106 @@ contract Unibow is BaseHook {
         return feeClassicBP;
     }
 
+    // lock liquidity for 3 months
+    function addLiquidity(
+        PoolKey calldata key,
+        int24 tickLower,
+        int24 tickUpper,
+        uint256 amount0Desired,
+        uint256 amount1Desired,
+        address recipient
+    ) external returns (uint256 tokenId,uint128 liquidity) {
+        PoolId poolId = key.toId();
+        (uint160 sqrtPriceX96,,,) =  StateLibrary.getSlot0(poolManager, poolId);
+
+        if (sqrtPriceX96 == 0) revert PoolNotInitialized();
+
+        tokenId = ++nextId;
+
+        uint128 poolLiquidity = StateLibrary.getLiquidity(poolManager, poolId);
+
+        uint160 sqrtPriceLower = TickMath.getSqrtPriceAtTick(tickLower);
+        uint160 sqrtPriceUpper = TickMath.getSqrtPriceAtTick(tickUpper);
+
+        liquidity = LiquidityAmounts.getLiquidityForAmounts(
+            sqrtPriceX96,
+            sqrtPriceLower,
+            sqrtPriceUpper,
+            amount0Desired,
+            amount1Desired
+        );
+
+        poolManager.modifyLiquidity(
+            key,
+            ModifyLiquidityParams({
+                tickLower: tickLower,
+                tickUpper: tickUpper,
+                liquidityDelta: int128(liquidity),
+                salt: 0
+            }),
+            ""
+        );      
+        
+        positions[tokenId] = LPPosition({
+            key: key,
+            tickLower: tickLower,
+            tickUpper: tickUpper,
+            liquidity: liquidity,
+            unlockTime: block.timestamp + lpLockTime,
+            exists: true
+        });
+
+        _mint(recipient, tokenId);
+    }
+
+    function removeLiquidity(uint256 tokenId, uint128 liquidity) external {
+        require(ownerOf(tokenId) == msg.sender, "Not NFT owner");
+
+        LPPosition storage p = positions[tokenId];
+        require(p.exists, "No position");
+        require(block.timestamp >= p.unlockTime, "Liquidity locked");
+        require(p.liquidity >= liquidity, "Not enough liquidity");
+
+        p.liquidity -= liquidity;
+
+        poolManager.modifyLiquidity(
+            p.key,
+            ModifyLiquidityParams({
+                tickLower: p.tickLower,
+                tickUpper: p.tickUpper,
+                liquidityDelta: -int128(liquidity),
+                salt: 0
+            }),
+            ""
+        );
+
+        if (p.liquidity == 0) {
+            delete positions[tokenId];
+            _burn(tokenId);
+        }
+    }
+
     // ---------------- Hooks -----------------
 
-    function _afterInitialize(
-        address sender,
-        PoolKey calldata key,
-        uint160 sqrtPriceX96,
-        int24 tick
-    ) internal override  returns (bytes4) {
+    function _afterInitialize(address sender, PoolKey calldata key, uint160 sqrtPriceX96, int24 tick)
+        internal
+        override
+        returns (bytes4)
+    {
         poolManager.updateDynamicLPFee(key, feeClassicBP);
 
         return BaseHook.afterInitialize.selector;
     }
 
-    function _beforeAddLiquidity(
-        address sender,
-        PoolKey calldata key,
-        ModifyLiquidityParams calldata params,
-        bytes calldata
-    ) internal override returns (bytes4) {        
-        PoolId pid = key.toId();
-        require(params.liquidityDelta > 0, "liquidityDelta must be positive for add");        
-        bytes32 pKey = _posKey(sender, params.tickLower, params.tickUpper, params.salt);
-        LPPosition storage info = lpPositions[pid][pKey];
-        uint256 baseLock = lpLockTime;
-        if (info.exists) {
-            // rebalance: extend lock +1 day and accumulate amounts
-            info.unlockTimestamp = info.unlockTimestamp + 1 days;
-        } else {
-            info.exists = true;
-            info.owner = sender;
-            info.unlockTimestamp = block.timestamp + baseLock;
+    /// 🔒 Blocage du mint classique
+    function _beforeAddLiquidity(address sender, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
+        internal
+        override
+        returns (bytes4)
+    {
+        if(sender != address(this)){
+            revert SenderMustBeHook();
         }
-
         return BaseHook.beforeAddLiquidity.selector;
     }
 
@@ -174,15 +252,7 @@ contract Unibow is BaseHook {
         ModifyLiquidityParams calldata params,
         bytes calldata
     ) internal override returns (bytes4) {
-        PoolId pid = key.toId();
-        bytes32 pKey = _posKey(sender, params.tickLower, params.tickUpper, params.salt);
-        LPPosition storage info = lpPositions[pid][pKey];
-        require(info.exists, "no locked position");
-        require(block.timestamp >= info.unlockTimestamp, "position locked");
-
-        // In a more advanced impl we would decrement amounts by the actual remove amounts computed in afterRemove
-        // For simplicity we delete the snapshot here
-        delete lpPositions[pid][pKey];
+        revert("Use removeLiquidityThroughHook");
         return BaseHook.beforeRemoveLiquidity.selector;
     }
 
@@ -322,5 +392,108 @@ contract Unibow is BaseHook {
                 / (sqrtPriceUpper * sqrtPriceX96Current / (1 << 96));
             amount1 = uint256(liquidityDelta) * (sqrtPriceX96Current - sqrtPriceLower) / (1 << 96);
         }
+    }
+
+     /// ---------- On-chain metadata + SVG rendering ----------
+    /// Returns a data:application/json;base64,.... URI with name/description/attributes and image (SVG base64)
+    function tokenURI(uint256 tokenId) public view override returns (string memory) {
+        require(tokenId > 0 && tokenId < nextId, "Nonexistent token");
+        LPPosition memory pos = positions[tokenId];
+
+        string memory svg = generateSVGofTokenById(tokenId);
+
+        string memory image = string(abi.encodePacked("data:image/svg+xml;base64,", Base64.encode(bytes(svg))));
+
+        // Build JSON
+        string memory json = string(
+            abi.encodePacked(
+                '{"name":"Unibow LP #',
+                tokenId.toString(),
+                '", "description":"Locked liquidity position managed by Unibow Hook.", "image":"',
+                image,
+                '", "attributes":[',
+                    '{"trait_type":"Tick Lower","value":"', intToString(pos.tickLower),'"},',
+                    '{"trait_type":"Tick Upper","value":"', intToString(pos.tickUpper),'"},',
+                    '{"trait_type":"Liquidity","value":"', uint256(pos.liquidity).toString(),'"},',
+                    '{"trait_type":"UnlockTime","value":"', pos.unlockTime.toString(), '"}',
+                ']}'
+            )
+        );
+
+        return string(abi.encodePacked("data:application/json;base64,", Base64.encode(bytes(json))));
+    }
+
+    function intToString(int256 value) internal pure returns (string memory) {
+    if (value >= 0) {
+        return uint256(value).toString();
+    } else {
+        return string(abi.encodePacked("-", uint256(-value).toString()));
+    }
+}
+
+    /// Produce a simple SVG representing the position:
+    /// - top: textual metadata,
+    /// - middle: a horizontal bar whose width ~ liquidity / VISUAL_LIQUIDITY_CAP,
+    /// - bottom: ticks & unlock time
+    function generateSVGofTokenById(uint256 tokenId) public view returns (string memory) {
+        LPPosition memory pos = positions[tokenId];
+
+        // clamp liquidity to cap for visual scale
+        uint256 liq = pos.liquidity;
+        uint256 capped = liq;
+        if (capped > VISUAL_LIQUIDITY_CAP) capped = VISUAL_LIQUIDITY_CAP;
+
+        // Bar width scaled to max 400 px
+        uint256 barMax = 400;
+        uint256 barWidth = (capped * barMax) / VISUAL_LIQUIDITY_CAP;
+
+        // Colors and simple layout
+        string memory title = string(abi.encodePacked("Unibow LP #", tokenId.toString()));
+        string memory ticks = string(abi.encodePacked("Ticks: ", intToString(pos.tickLower), " / ", intToString(pos.tickUpper)));
+        string memory liqText = string(abi.encodePacked("Liquidity: ", uint256(pos.liquidity).toString()));
+        string memory unlockText = string(abi.encodePacked("Unlock: ", pos.unlockTime.toString()));
+
+        // Build SVG
+        string memory svg = string(
+            abi.encodePacked(
+                '<svg xmlns="http://www.w3.org/2000/svg" width="520" height="220" viewBox="0 0 520 220">',
+                    '<style>',
+                        'text{font-family:Arial,sans-serif;fill:#111;font-size:14px;}',
+                        '.title{font-size:16px;font-weight:600;}',
+                        '.muted{font-size:12px;fill:#666;}',
+                    '</style>',
+
+                    // background
+                    '<rect width="100%" height="100%" fill="#f8fafc" rx="12" />',
+
+                    // title
+                    '<text x="20" y="30" class="title">', title, '</text>',
+
+                    // liquidity text
+                    '<text x="20" y="60">', liqText, '</text>',
+
+                    // bar background
+                    '<rect x="20" y="75" width="400" height="24" rx="6" fill="#e6e9ef"/>',
+
+                    // bar fill
+                    '<rect x="20" y="75" width="', uint2str(barWidth), '" height="24" rx="6" fill="#4f46e5"/>',
+
+                    // ticks and unlock
+                    '<text x="20" y="115" class="muted">', ticks, '</text>',
+                    '<text x="20" y="135" class="muted">', unlockText, '</text>',
+
+                    // small footer
+                    '<text x="20" y="195" class="muted">Unibow - on-chain position</text>',
+
+                '</svg>'
+            )
+        );
+
+        return svg;
+    }
+
+    /// helper uint->string using Strings
+    function uint2str(uint256 _i) internal pure returns (string memory) {
+        return Strings.toString(_i);
     }
 }
