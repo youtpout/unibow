@@ -53,7 +53,7 @@ contract UnibowTest is Test, Deployers {
         // Déploiement du hook à une adresse avec flags Uniswap v4
         address flags = address(
             uint160(
-                Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+                Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG
                     | Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG
             ) ^ (0x4444 << 144)
         );
@@ -116,24 +116,33 @@ contract UnibowTest is Test, Deployers {
 
     function testBorrowAndRepayFlow() public {
         // Borrower swap pour emprunter
-        uint256 amountIn = 100e18;
-        BalanceDelta swapDelta = swapRouter.swapExactTokensForTokens({
-            amountIn: amountIn,
-            amountOutMin: 1,
-            zeroForOne: true,
-            poolKey: poolKey,
-            hookData: abi.encode(
-                Unibow.BorrowData({
-                    borrower: borrower,
-                    isBorrow: true,
-                    tokenIndex: 0,
-                    durationSeconds: 0,
-                    expectedOut: amountIn
-                })
-            ),
-            receiver: borrower,
-            deadline: block.timestamp + 1
-        });
+        uint256 amountIn = 1e18;
+        // BalanceDelta swapDelta = swapRouter.swapExactTokensForTokens({
+        //     amountIn: amountIn,
+        //     amountOutMin: 1,
+        //     zeroForOne: true,
+        //     poolKey: poolKey,
+        //     hookData: abi.encode(
+        //         Unibow.BorrowData({
+        //             borrower: borrower,
+        //             isBorrow: true,
+        //             tokenIndex: 0,
+        //             durationSeconds: 0,
+        //             expectedOut: amountIn
+        //         })
+        //     ),
+        //     receiver: borrower,
+        //     deadline: block.timestamp + 1
+        // });
+
+        uint256 balOut = hook.loan(address(swapRouter), poolKey, 0, 0, amountIn, 1, true, borrower);
+        console.log("balOut", balOut);
+
+        uint256 bal0 = IERC20(Currency.unwrap(currency0)).balanceOf(borrower);
+        uint256 bal1 = IERC20(Currency.unwrap(currency1)).balanceOf(borrower);
+
+        console.log("bal0", bal0);
+        console.log("bal1", bal1);
 
         assertEq(hook.nextLoanId(poolId), 1);
 

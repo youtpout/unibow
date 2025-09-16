@@ -36,6 +36,7 @@ import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import {Base64} from "@openzeppelin/contracts/utils/Base64.sol";
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
+import {IUniswapV4Router04} from "hookmate/interfaces/router/IUniswapV4Router04.sol";
 
 contract Unibow is BaseHook, ERC721, IUnlockCallback {
     using PoolIdLibrary for PoolKey;
@@ -128,7 +129,7 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
             beforeRemoveLiquidity: true,
             afterRemoveLiquidity: false,
             beforeSwap: true,
-            afterSwap: true,
+            afterSwap: false,
             beforeDonate: false,
             afterDonate: false,
             beforeSwapReturnDelta: false,
@@ -156,6 +157,61 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
         if (isBorrowing) return feeBorrowBP;
         if (isRebalancing) return feeRebalBP;
         return feeClassicBP;
+    }
+
+    function loan(
+        address swapRouter,
+        PoolKey calldata key,
+        int24 tickLower,
+        int24 tickUpper,
+        uint256 amountIn,
+        uint256 amountOutMin,
+        bool zeroForOne,
+        address recipient
+    ) external returns (uint256 amountOut) {
+        if(zeroForOne){
+    IERC20(Currency.unwrap(key.currency0)).transferFrom(msg.sender,address(this), amountIn);
+    IERC20(  Currency.unwrap(key.currency0)).approve(swapRouter, amountIn);
+        }else{
+  IERC20(Currency.unwrap(key.currency1)).transferFrom(msg.sender,address(this), amountIn);
+    IERC20(  Currency.unwrap(key.currency1)).approve(swapRouter, amountIn);
+        }        
+    
+        // Todo : replace by pool manager swap
+        BalanceDelta swapDelta = IUniswapV4Router04(payable(swapRouter)).swapExactTokensForTokens({
+            amountIn: amountIn,
+            amountOutMin: amountOutMin,
+            zeroForOne: zeroForOne,
+            poolKey: key,
+            hookData: abi.encode(
+                Unibow.BorrowData({
+                    borrower: recipient,
+                    isBorrow: true,
+                    tokenIndex: 0,
+                    durationSeconds: 0,
+                    expectedOut: amountIn
+                })
+            ),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        int128 amount = zeroForOne ? swapDelta.amount1() : swapDelta.amount0();
+        amountOut = uint256(amount > 0 ? uint128(amount) : uint128(-amount));
+
+        PoolId poolId = key.toId();
+        uint256 loanId = ++nextLoanId[poolId];
+        loans[poolId][loanId] = LoanEscrow({
+            borrower: recipient,
+            tokenIndex: zeroForOne ? 1 : 0,
+            amountBorrowed: 0,
+            L_add_amount0: 0,
+            L_add_amount1: 0,
+            start: block.timestamp,
+            maturity: block.timestamp + borrowRepayWindow,
+            repaid: false,
+            exists: true
+        });
     }
 
     // lock liquidity for 3 months
@@ -337,90 +393,20 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
     {
         PoolId pid = key.toId();
         BorrowData memory bd;
-        if (data.length > 0) bd = abi.decode(data, (BorrowData));
+        bool isBorrow = false;
 
-        require(bd.borrower != address(0), "borrower required in data");
-
-        uint24 fee = _getFee(bd.isBorrow, false) | LPFeeLibrary.OVERRIDE_FEE_FLAG;
-
-        if (!bd.isBorrow) {
-            // classic swap: no special handling inside hook - pool handles feeClassicBP
-            return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, fee);
+        if (data.length > 0) 
+        {
+        bd = abi.decode(data, (BorrowData));
+         isBorrow = bd.isBorrow;
         }
-
-        // Borrow: perform pre-check capacity
-        uint8 tokenIndex = bd.tokenIndex;
-
-        // register loan placeholder; actual amounts will be filled in afterSwap when we know the real out amount
-        uint256 loanId = ++nextLoanId[pid];
-        loans[pid][loanId] = LoanEscrow({
-            borrower: bd.borrower,
-            tokenIndex: tokenIndex,
-            amountBorrowed: 0,
-            L_add_amount0: 0,
-            L_add_amount1: 0,
-            start: block.timestamp,
-            maturity: block.timestamp + borrowRepayWindow,
-            repaid: false,
-            exists: true
-        });
+       
+        uint24 fee = _getFee(isBorrow, false) | LPFeeLibrary.OVERRIDE_FEE_FLAG;
 
         return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, fee);
     }
 
-    // afterSwap must parse BalanceDelta to discover actual token out amounts and finalize the loan
-    function _afterSwap(
-        address,
-        PoolKey calldata key,
-        SwapParams calldata params,
-        BalanceDelta delta,
-        bytes calldata data
-    ) internal override returns (bytes4, int128) {
-        PoolId pid = key.toId();
-        uint256 loanId = nextLoanId[pid] == 0 ? 0 : nextLoanId[pid] - 1;
-        if (loanId == 0) return (BaseHook.afterSwap.selector, 0);
-        LoanEscrow storage ln = loans[pid][loanId];
-        if (!ln.exists || ln.repaid) return (BaseHook.afterSwap.selector, 0);
-
-        // TODO: parse BalanceDelta to obtain actual token amounts transferred out to borrower.
-        // BalanceDelta contains arrays of (tokenId, amount) changes; in this skeleton we assume the caller
-        // encodes actualOut in data for simplicity.
-        uint256 actualOut = 0;
-        if (data.length >= 32) {
-            (,, uint256 actualOutEncoded) = abi.decode(data, (bool, uint8, uint256));
-            actualOut = actualOutEncoded;
-        }
-        require(actualOut > 0, "actual out unknown");
-
-        // compute fee, split and L_add
-        uint256 fee = (actualOut * feeBorrowBP) / BASIS; // fee goes to LPs via pool
-        uint256 V_net = actualOut - fee;
-        uint256 borrowerAmount = (V_net * borrowableRatioBP) / BASIS; // 80%
-        uint256 L_add_net = V_net - borrowerAmount; // 20%
-
-        // Convert L_add_net into underlying token0/token1 amounts to mint LP
-        // Simplest approach: approximate that L_add_net is entirely in borrowed token (swap half for other token),
-        // but real implementation should call poolManager.addLiquidity with correct amounts.
-        // We'll store L_add in borrowed token side only for record (exact minting handled off-chain/keeper)
-        if (ln.tokenIndex == 0) {
-            ln.L_add_amount0 = L_add_net;
-            ln.L_add_amount1 = 0;
-        } else {
-            ln.L_add_amount1 = L_add_net;
-            ln.L_add_amount0 = 0;
-        }
-
-        ln.amountBorrowed = borrowerAmount;
-
-        // update reserves approximation
-        if (ln.tokenIndex == 0) poolReserve0[pid] = poolReserve0[pid] + fee + ln.L_add_amount0 - borrowerAmount;
-        else poolReserve1[pid] = poolReserve1[pid] + fee + ln.L_add_amount1 - borrowerAmount;
-
-        // Note: actual LP mint and escrow must be handled by interacting with poolManager/addLiquidity
-        // and recording the LP token id mapping to this loan. That requires more periphery integration.
-
-        return (BaseHook.afterSwap.selector, 0);
-    }
+  
 
     // repay: borrower calls repayLoan with loanId and transfers borrowed token back to the pool/hook
     function repayLoan(PoolKey calldata key, uint256 loanId) external {
