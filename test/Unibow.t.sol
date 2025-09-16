@@ -6,7 +6,7 @@ import {Test, console} from "forge-std/Test.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
-import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {IPoolManager,ModifyLiquidityParams} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
@@ -95,14 +95,14 @@ contract UnibowTest is Test, Deployers {
         // can't withdraw before 90 days
         vm.expectRevert();
         vm.prank(lp);
-        hook.removeLiquidity(tokenId,1);
+        hook.removeLiquidity(tokenId, 1);
     }
 
     function testBorrowAndRepayFlow() public {
-        // Ask to borrow 
+        // Ask to borrow
         uint256 amountIn = 1e18;
 
-        (uint256 loanId,uint256 balOut) = hook.loan(address(swapRouter), poolKey,amountIn, 1, true, borrower);
+        (uint256 loanId, uint256 balOut) = hook.loan(address(swapRouter), poolKey, amountIn, 1, true, borrower);
         console.log("balOut", balOut);
 
         uint256 bal0 = IERC20(Currency.unwrap(currency0)).balanceOf(borrower);

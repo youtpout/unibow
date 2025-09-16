@@ -72,7 +72,7 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
         uint128 liquidity;
         bool exists;
         bool zeroForOne;
-        uint32 unlockTime;        
+        uint32 unlockTime;
         uint32 borrowMaturity;
         uint128 collateralAmount;
         uint128 borrowAmount;
@@ -183,23 +183,22 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
         uint256 totalOut = uint256(amount > 0 ? uint128(amount) : uint128(-amount));
 
         amountOut = (totalOut * borrowableRatioBP) / BASIS;
-        require(amountOut>= amountOutMin,InsufficientOutputAmount());
+        require(amountOut >= amountOutMin, InsufficientOutputAmount());
         uint256 amountLiquidity = totalOut - amountOut;
         uint256 collateralAmount = amountIn - (amountIn * feeBorrowBP) / BASIS;
         require(collateralAmount < amountIn, WrongCollateralCalculation());
 
         PoolId poolId = key.toId();
-        (uint160 sqrtPriceX96,int24 currentTick,,) = StateLibrary.getSlot0(poolManager, poolId);
+        (uint160 sqrtPriceX96, int24 currentTick,,) = StateLibrary.getSlot0(poolManager, poolId);
 
         if (sqrtPriceX96 == 0) revert PoolNotInitialized();
 
         tokenId = ++nextId;
 
         uint128 poolLiquidity = StateLibrary.getLiquidity(poolManager, poolId);
-       
 
-        int24 tickLower= TickMath.minUsableTick(key.tickSpacing);
-        int24 tickUpper=  TickMath.maxUsableTick(key.tickSpacing);
+        int24 tickLower = TickMath.minUsableTick(key.tickSpacing);
+        int24 tickUpper = TickMath.maxUsableTick(key.tickSpacing);
 
         uint160 sqrtPriceLower = TickMath.getSqrtPriceAtTick(tickLower);
         uint160 sqrtPriceUpper = TickMath.getSqrtPriceAtTick(tickUpper);
@@ -236,11 +235,10 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
         _mint(recipient, tokenId);
 
         if (zeroForOne) {
-            IERC20(Currency.unwrap(key.currency1)).transfer(recipient, amountOut);          
+            IERC20(Currency.unwrap(key.currency1)).transfer(recipient, amountOut);
         } else {
             IERC20(Currency.unwrap(key.currency0)).transfer(recipient, amountOut);
         }
-       
     }
 
     // lock liquidity for 3 months
