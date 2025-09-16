@@ -44,7 +44,7 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
     using LPFeeLibrary for uint24;
     using CurrencyLibrary for Currency;
 
-    uint256 public constant BASIS = 10_000; // bps scale
+    uint256 public constant BASIS = 100_000; // bps scale
 
     // For visual scaling of liquidity bar in SVG
     uint256 public constant VISUAL_LIQUIDITY_CAP = 1e18; // cap used to scale the bar width
@@ -70,25 +70,16 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
         int24 tickLower;
         int24 tickUpper;
         uint128 liquidity;
-        uint256 unlockTime;
         bool exists;
+        bool zeroForOne;
+        uint32 unlockTime;        
+        uint32 borrowMaturity;
+        uint128 collateralAmount;
+        uint128 borrowAmount;
     }
 
     mapping(uint256 => LPPosition) public positions;
     uint256 public nextId;
-
-    // loan escrow
-    struct LoanEscrow {
-        address borrower;
-        uint8 tokenIndex; // 0 => token0, 1 => token1
-        uint256 amountBorrowed; // amount borrower received (80% of V_net)
-        uint256 L_add_amount0; // LP minted amounts (token0 side)
-        uint256 L_add_amount1; // LP minted amounts (token1 side)
-        uint256 start;
-        uint256 maturity;
-        bool repaid;
-        bool exists;
-    }
 
     /// @notice Data passed during unlocking liquidity callback, includes sender and key info.
     /// @param sender Address of the sender initiating the unlock.
@@ -100,14 +91,6 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
         ModifyLiquidityParams params;
     }
 
-    // pool => loanId => LoanEscrow
-    mapping(PoolId => mapping(uint256 => LoanEscrow)) public loans;
-    mapping(PoolId => uint256) public nextLoanId;
-
-    // approximate pool reserves for instant cap
-    mapping(PoolId => uint256) public poolReserve0;
-    mapping(PoolId => uint256) public poolReserve1;
-
     mapping(PoolId => uint256) public totalBorrowed0;
     mapping(PoolId => uint256) public totalBorrowed1;
 
@@ -116,6 +99,8 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
     error PoolNotInitialized();
     error SenderMustBeHook();
     error MustUseDynamicFee();
+    error WrongCollateralCalculation();
+    error InsufficientOutputAmount();
 
     constructor(IPoolManager _pm) BaseHook(_pm) ERC721("Unibow LP", "UBLP") {}
 
@@ -162,21 +147,19 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
     function loan(
         address swapRouter,
         PoolKey calldata key,
-        int24 tickLower,
-        int24 tickUpper,
         uint256 amountIn,
         uint256 amountOutMin,
         bool zeroForOne,
         address recipient
-    ) external returns (uint256 amountOut) {
-        if(zeroForOne){
-    IERC20(Currency.unwrap(key.currency0)).transferFrom(msg.sender,address(this), amountIn);
-    IERC20(  Currency.unwrap(key.currency0)).approve(swapRouter, amountIn);
-        }else{
-  IERC20(Currency.unwrap(key.currency1)).transferFrom(msg.sender,address(this), amountIn);
-    IERC20(  Currency.unwrap(key.currency1)).approve(swapRouter, amountIn);
-        }        
-    
+    ) external returns (uint256 tokenId, uint256 amountOut) {
+        if (zeroForOne) {
+            IERC20(Currency.unwrap(key.currency0)).transferFrom(msg.sender, address(this), amountIn);
+            IERC20(Currency.unwrap(key.currency0)).approve(swapRouter, amountIn);
+        } else {
+            IERC20(Currency.unwrap(key.currency1)).transferFrom(msg.sender, address(this), amountIn);
+            IERC20(Currency.unwrap(key.currency1)).approve(swapRouter, amountIn);
+        }
+
         // Todo : replace by pool manager swap
         BalanceDelta swapDelta = IUniswapV4Router04(payable(swapRouter)).swapExactTokensForTokens({
             amountIn: amountIn,
@@ -197,21 +180,67 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
         });
 
         int128 amount = zeroForOne ? swapDelta.amount1() : swapDelta.amount0();
-        amountOut = uint256(amount > 0 ? uint128(amount) : uint128(-amount));
+        uint256 totalOut = uint256(amount > 0 ? uint128(amount) : uint128(-amount));
+
+        amountOut = (totalOut * borrowableRatioBP) / BASIS;
+        require(amountOut>= amountOutMin,InsufficientOutputAmount());
+        uint256 amountLiquidity = totalOut - amountOut;
+        uint256 collateralAmount = amountIn - (amountIn * feeBorrowBP) / BASIS;
+        require(collateralAmount < amountIn, WrongCollateralCalculation());
 
         PoolId poolId = key.toId();
-        uint256 loanId = ++nextLoanId[poolId];
-        loans[poolId][loanId] = LoanEscrow({
-            borrower: recipient,
-            tokenIndex: zeroForOne ? 1 : 0,
-            amountBorrowed: 0,
-            L_add_amount0: 0,
-            L_add_amount1: 0,
-            start: block.timestamp,
-            maturity: block.timestamp + borrowRepayWindow,
-            repaid: false,
-            exists: true
+        (uint160 sqrtPriceX96,int24 currentTick,,) = StateLibrary.getSlot0(poolManager, poolId);
+
+        if (sqrtPriceX96 == 0) revert PoolNotInitialized();
+
+        tokenId = ++nextId;
+
+        uint128 poolLiquidity = StateLibrary.getLiquidity(poolManager, poolId);
+       
+
+        int24 tickLower= TickMath.minUsableTick(key.tickSpacing);
+        int24 tickUpper=  TickMath.maxUsableTick(key.tickSpacing);
+
+        uint160 sqrtPriceLower = TickMath.getSqrtPriceAtTick(tickLower);
+        uint160 sqrtPriceUpper = TickMath.getSqrtPriceAtTick(tickUpper);
+
+        uint256 amount0 = zeroForOne ? 0 : amountLiquidity;
+        uint256 amount1 = zeroForOne ? amountLiquidity : 0;
+        uint128 liquidity =
+            LiquidityAmounts.getLiquidityForAmounts(sqrtPriceX96, sqrtPriceLower, sqrtPriceUpper, amount0, amount1);
+
+        // Use unlock pattern instead of direct modifyLiquidity call
+        ModifyLiquidityParams memory params = ModifyLiquidityParams({
+            tickLower: tickLower,
+            tickUpper: tickUpper,
+            liquidityDelta: int256(amountLiquidity),
+            salt: 0
         });
+
+        // Call through unlock mechanism
+        _modifyLiquidity(msg.sender, key, params);
+
+        positions[tokenId] = LPPosition({
+            key: key,
+            tickLower: tickLower,
+            tickUpper: tickUpper,
+            liquidity: liquidity,
+            unlockTime: uint32(block.timestamp + lpLockTime),
+            exists: true,
+            zeroForOne: zeroForOne,
+            borrowMaturity: uint32(block.timestamp + borrowRepayWindow),
+            borrowAmount: uint128(totalOut),
+            collateralAmount: uint128(collateralAmount)
+        });
+
+        _mint(recipient, tokenId);
+
+        if (zeroForOne) {
+            IERC20(Currency.unwrap(key.currency1)).transfer(recipient, amountOut);          
+        } else {
+            IERC20(Currency.unwrap(key.currency0)).transfer(recipient, amountOut);
+        }
+       
     }
 
     // lock liquidity for 3 months
@@ -248,15 +277,19 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
         });
 
         // Call through unlock mechanism
-        _modifyLiquidity(key, params);
+        _modifyLiquidity(msg.sender, key, params);
 
         positions[tokenId] = LPPosition({
             key: key,
             tickLower: tickLower,
             tickUpper: tickUpper,
             liquidity: liquidity,
-            unlockTime: block.timestamp + lpLockTime,
-            exists: true
+            unlockTime: uint32(block.timestamp + lpLockTime),
+            exists: true,
+            zeroForOne: false,
+            borrowMaturity: 0,
+            borrowAmount: 0,
+            collateralAmount: 0
         });
 
         _mint(recipient, tokenId);
@@ -281,7 +314,7 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
         });
 
         // Call through unlock mechanism
-        _modifyLiquidity(p.key, params);
+        _modifyLiquidity(msg.sender, p.key, params);
 
         if (p.liquidity == 0) {
             delete positions[tokenId];
@@ -347,11 +380,11 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
     /// @param key The pool key associated with the liquidity modification.
     /// @param params The liquidity modification parameters.
     /// @return delta The resulting balance changes from the liquidity modification.
-    function _modifyLiquidity(PoolKey memory key, ModifyLiquidityParams memory params)
+    function _modifyLiquidity(address sender, PoolKey memory key, ModifyLiquidityParams memory params)
         internal
         returns (BalanceDelta delta)
     {
-        delta = abi.decode(poolManager.unlock(abi.encode(CallbackData(msg.sender, key, params))), (BalanceDelta));
+        delta = abi.decode(poolManager.unlock(abi.encode(CallbackData(sender, key, params))), (BalanceDelta));
     }
 
     /// @notice Settles any owed balances after liquidity modification.
@@ -395,37 +428,36 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
         BorrowData memory bd;
         bool isBorrow = false;
 
-        if (data.length > 0) 
-        {
-        bd = abi.decode(data, (BorrowData));
-         isBorrow = bd.isBorrow;
+        if (data.length > 0) {
+            bd = abi.decode(data, (BorrowData));
+            isBorrow = bd.isBorrow;
         }
-       
+
         uint24 fee = _getFee(isBorrow, false) | LPFeeLibrary.OVERRIDE_FEE_FLAG;
 
         return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, fee);
     }
 
-  
-
     // repay: borrower calls repayLoan with loanId and transfers borrowed token back to the pool/hook
-    function repayLoan(PoolKey calldata key, uint256 loanId) external {
-        PoolId pid = key.toId();
-        LoanEscrow storage ln = loans[pid][loanId];
-        require(ln.exists && !ln.repaid, "invalid loan");
-        require(msg.sender == ln.borrower, "only borrower");
-        require(block.timestamp <= ln.maturity, "repay window closed");
+    function repayLoan(uint256 tokenId) external {
+        require(ownerOf(tokenId) == msg.sender, "Not NFT owner");
+        LPPosition storage lp = positions[tokenId];
+        require(lp.collateralAmount > 0, "invalid loan");
+        require(block.timestamp <= lp.borrowMaturity, "repay window closed");
 
-        // In production: transfer borrowed token from borrower to pool/vault via transferFrom
-        // For skeleton we skip ERC20 mechanics and assume transfer done off-chain
+        // Use unlock pattern instead of direct modifyLiquidity call
+        ModifyLiquidityParams memory params = ModifyLiquidityParams({
+            tickLower: lp.tickLower,
+            tickUpper: lp.tickUpper,
+            liquidityDelta: int128(lp.liquidity),
+            salt: 0
+        });
 
-        // Burn escrow LP and return assets to borrower (requires poolManager interaction)
+        // Call through unlock mechanism
+        _modifyLiquidity(address(this), lp.key, params);
 
-        // update reserves
-        if (ln.tokenIndex == 0) poolReserve0[pid] = poolReserve0[pid] + ln.amountBorrowed - ln.L_add_amount0;
-        else poolReserve1[pid] = poolReserve1[pid] + ln.amountBorrowed - ln.L_add_amount1;
-
-        ln.repaid = true;
+        delete positions[tokenId];
+        _burn(tokenId);
     }
 
     function getAmountsForLiquidity(
@@ -482,7 +514,7 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
                 uint256(pos.liquidity).toString(),
                 '"},',
                 '{"trait_type":"UnlockTime","value":"',
-                pos.unlockTime.toString(),
+                uint256(pos.unlockTime).toString(),
                 '"}',
                 "]}"
             )
@@ -520,7 +552,7 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
         string memory ticks =
             string(abi.encodePacked("Ticks: ", intToString(pos.tickLower), " / ", intToString(pos.tickUpper)));
         string memory liqText = string(abi.encodePacked("Liquidity: ", uint256(pos.liquidity).toString()));
-        string memory unlockText = string(abi.encodePacked("Unlock: ", pos.unlockTime.toString()));
+        string memory unlockText = string(abi.encodePacked("Unlock: ", uint256(pos.unlockTime).toString()));
 
         // Build SVG
         string memory svg = string(
