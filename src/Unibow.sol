@@ -99,6 +99,7 @@ contract Unibow is BaseHook, ERC721 {
 
     error PoolNotInitialized();
     error SenderMustBeHook();
+    error MustUseDynamicFee();
 
 
     constructor(IPoolManager _pm) BaseHook(_pm) ERC721("Unibow LP", "UBLP") {}
@@ -229,6 +230,7 @@ contract Unibow is BaseHook, ERC721 {
         override
         returns (bytes4)
     {
+        if (!key.fee.isDynamicFee()) revert MustUseDynamicFee();
         poolManager.updateDynamicLPFee(key, feeClassicBP);
 
         return BaseHook.afterInitialize.selector;
