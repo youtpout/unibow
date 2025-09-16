@@ -30,16 +30,18 @@ import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
 // periphery libraries
 import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmounts.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
-import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
-
+import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
 import {Constants} from "@uniswap/v4-core/test/utils/Constants.sol";
 import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import {Base64} from "@openzeppelin/contracts/utils/Base64.sol";
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
+import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
 
-contract Unibow is BaseHook, ERC721 {
+contract Unibow is BaseHook, ERC721, IUnlockCallback {
     using PoolIdLibrary for PoolKey;
     using Strings for uint256;
+    using LPFeeLibrary for uint24;
+    using CurrencyLibrary for Currency;
 
     uint256 public constant BASIS = 10_000; // bps scale
 
@@ -59,6 +61,9 @@ contract Unibow is BaseHook, ERC721 {
     // safety
     uint256 public triggerRation = 100_000; // if loan > 10% of liquidity, borrow ratio is reduced
     uint256 public ratioByPercent = 30_000; // 3%
+
+    bytes internal constant ZERO_BYTES = bytes("");
+
     struct LPPosition {
         PoolKey key;
         int24 tickLower;
@@ -84,6 +89,16 @@ contract Unibow is BaseHook, ERC721 {
         bool exists;
     }
 
+    /// @notice Data passed during unlocking liquidity callback, includes sender and key info.
+    /// @param sender Address of the sender initiating the unlock.
+    /// @param key The pool key associated with the liquidity position.
+    /// @param params Parameters for modifying liquidity.
+    struct CallbackData {
+        address sender;
+        PoolKey key;
+        ModifyLiquidityParams params;
+    }
+
     // pool => loanId => LoanEscrow
     mapping(PoolId => mapping(uint256 => LoanEscrow)) public loans;
     mapping(PoolId => uint256) public nextLoanId;
@@ -100,7 +115,6 @@ contract Unibow is BaseHook, ERC721 {
     error PoolNotInitialized();
     error SenderMustBeHook();
     error MustUseDynamicFee();
-
 
     constructor(IPoolManager _pm) BaseHook(_pm) ERC721("Unibow LP", "UBLP") {}
 
@@ -152,9 +166,9 @@ contract Unibow is BaseHook, ERC721 {
         uint256 amount0Desired,
         uint256 amount1Desired,
         address recipient
-    ) external returns (uint256 tokenId,uint128 liquidity) {
+    ) external returns (uint256 tokenId, uint128 liquidity) {
         PoolId poolId = key.toId();
-        (uint160 sqrtPriceX96,,,) =  StateLibrary.getSlot0(poolManager, poolId);
+        (uint160 sqrtPriceX96,,,) = StateLibrary.getSlot0(poolManager, poolId);
 
         if (sqrtPriceX96 == 0) revert PoolNotInitialized();
 
@@ -166,24 +180,20 @@ contract Unibow is BaseHook, ERC721 {
         uint160 sqrtPriceUpper = TickMath.getSqrtPriceAtTick(tickUpper);
 
         liquidity = LiquidityAmounts.getLiquidityForAmounts(
-            sqrtPriceX96,
-            sqrtPriceLower,
-            sqrtPriceUpper,
-            amount0Desired,
-            amount1Desired
+            sqrtPriceX96, sqrtPriceLower, sqrtPriceUpper, amount0Desired, amount1Desired
         );
 
-        poolManager.modifyLiquidity(
-            key,
-            ModifyLiquidityParams({
-                tickLower: tickLower,
-                tickUpper: tickUpper,
-                liquidityDelta: int128(liquidity),
-                salt: 0
-            }),
-            ""
-        );      
-        
+        // Use unlock pattern instead of direct modifyLiquidity call
+        ModifyLiquidityParams memory params = ModifyLiquidityParams({
+            tickLower: tickLower,
+            tickUpper: tickUpper,
+            liquidityDelta: int128(liquidity),
+            salt: 0
+        });
+
+        // Call through unlock mechanism
+        _modifyLiquidity(key, params);
+
         positions[tokenId] = LPPosition({
             key: key,
             tickLower: tickLower,
@@ -206,16 +216,16 @@ contract Unibow is BaseHook, ERC721 {
 
         p.liquidity -= liquidity;
 
-        poolManager.modifyLiquidity(
-            p.key,
-            ModifyLiquidityParams({
-                tickLower: p.tickLower,
-                tickUpper: p.tickUpper,
-                liquidityDelta: -int128(liquidity),
-                salt: 0
-            }),
-            ""
-        );
+        // Use unlock pattern instead of direct modifyLiquidity call
+        ModifyLiquidityParams memory params = ModifyLiquidityParams({
+            tickLower: p.tickLower,
+            tickUpper: p.tickUpper,
+            liquidityDelta: int128(liquidity),
+            salt: 0
+        });
+
+        // Call through unlock mechanism
+        _modifyLiquidity(p.key, params);
 
         if (p.liquidity == 0) {
             delete positions[tokenId];
@@ -242,7 +252,7 @@ contract Unibow is BaseHook, ERC721 {
         override
         returns (bytes4)
     {
-        if(sender != address(this)){
+        if (sender != address(this)) {
             revert SenderMustBeHook();
         }
         return BaseHook.beforeAddLiquidity.selector;
@@ -254,8 +264,70 @@ contract Unibow is BaseHook, ERC721 {
         ModifyLiquidityParams calldata params,
         bytes calldata
     ) internal override returns (bytes4) {
-        revert("Use removeLiquidityThroughHook");
+        if (sender != address(this)) {
+            revert SenderMustBeHook();
+        }
         return BaseHook.beforeRemoveLiquidity.selector;
+    }
+
+    /// @notice Callback function invoked during the unlock of liquidity, executing any required state changes.
+    /// @param rawData Encoded data containing details for the unlock operation.
+    /// @return Encoded result of the liquidity modification.
+    function unlockCallback(bytes calldata rawData) external override onlyPoolManager returns (bytes memory) {
+        CallbackData memory data = abi.decode(rawData, (CallbackData));
+        BalanceDelta delta;
+
+        if (data.params.liquidityDelta > 0) {
+            (delta,) = poolManager.modifyLiquidity(data.key, data.params, ZERO_BYTES);
+            _settleDeltas(data.sender, data.key, delta);
+        } else {
+            (delta,) = poolManager.modifyLiquidity(data.key, data.params, ZERO_BYTES);
+            _takeDeltas(data.sender, data.key, delta);
+        }
+        return abi.encode(delta);
+    }
+
+    /// @notice Internal function to modify liquidity settings based on the provided parameters.
+    /// @param key The pool key associated with the liquidity modification.
+    /// @param params The liquidity modification parameters.
+    /// @return delta The resulting balance changes from the liquidity modification.
+    function _modifyLiquidity(PoolKey memory key, ModifyLiquidityParams memory params)
+        internal
+        returns (BalanceDelta delta)
+    {
+        delta = abi.decode(poolManager.unlock(abi.encode(CallbackData(msg.sender, key, params))), (BalanceDelta));
+    }
+
+    /// @notice Settles any owed balances after liquidity modification.
+    /// @param sender Address of the user performing the liquidity modification.
+    /// @param key The pool key associated with the liquidity modification.
+    /// @param delta The balance delta resulting from the liquidity modification.
+    function _settleDeltas(address sender, PoolKey memory key, BalanceDelta delta) internal {
+        _settleDelta(sender, key.currency0, uint256(int256(-delta.amount0())));
+        _settleDelta(sender, key.currency1, uint256(int256(-delta.amount1())));
+    }
+
+    function _settleDelta(address sender, Currency currency, uint256 amount) internal {
+        if (currency.isAddressZero()) {
+            poolManager.settle{value: amount}();
+        } else {
+            poolManager.sync(currency);
+            if (sender != address(this)) {
+                IERC20(Currency.unwrap(currency)).transferFrom(sender, address(poolManager), amount);
+            } else {
+                IERC20(Currency.unwrap(currency)).transfer(address(poolManager), amount);
+            }
+            poolManager.settle();
+        }
+    }
+
+    /// @notice Takes owed balances after liquidity modification.
+    /// @param sender Address of the user performing the liquidity modification.
+    /// @param key The pool key associated with the liquidity modification.
+    /// @param delta The balance delta resulting from the liquidity modification.
+    function _takeDeltas(address sender, PoolKey memory key, BalanceDelta delta) internal {
+        poolManager.take(key.currency0, sender, uint256(uint128(delta.amount0())));
+        poolManager.take(key.currency1, sender, uint256(uint128(delta.amount1())));
     }
 
     function _beforeSwap(address, PoolKey calldata key, SwapParams calldata params, bytes calldata data)
@@ -396,7 +468,7 @@ contract Unibow is BaseHook, ERC721 {
         }
     }
 
-     /// ---------- On-chain metadata + SVG rendering ----------
+    /// ---------- On-chain metadata + SVG rendering ----------
     /// Returns a data:application/json;base64,.... URI with name/description/attributes and image (SVG base64)
     function tokenURI(uint256 tokenId) public view override returns (string memory) {
         require(tokenId > 0 && tokenId < nextId, "Nonexistent token");
@@ -414,11 +486,19 @@ contract Unibow is BaseHook, ERC721 {
                 '", "description":"Locked liquidity position managed by Unibow Hook.", "image":"',
                 image,
                 '", "attributes":[',
-                    '{"trait_type":"Tick Lower","value":"', intToString(pos.tickLower),'"},',
-                    '{"trait_type":"Tick Upper","value":"', intToString(pos.tickUpper),'"},',
-                    '{"trait_type":"Liquidity","value":"', uint256(pos.liquidity).toString(),'"},',
-                    '{"trait_type":"UnlockTime","value":"', pos.unlockTime.toString(), '"}',
-                ']}'
+                '{"trait_type":"Tick Lower","value":"',
+                intToString(pos.tickLower),
+                '"},',
+                '{"trait_type":"Tick Upper","value":"',
+                intToString(pos.tickUpper),
+                '"},',
+                '{"trait_type":"Liquidity","value":"',
+                uint256(pos.liquidity).toString(),
+                '"},',
+                '{"trait_type":"UnlockTime","value":"',
+                pos.unlockTime.toString(),
+                '"}',
+                "]}"
             )
         );
 
@@ -426,12 +506,12 @@ contract Unibow is BaseHook, ERC721 {
     }
 
     function intToString(int256 value) internal pure returns (string memory) {
-    if (value >= 0) {
-        return uint256(value).toString();
-    } else {
-        return string(abi.encodePacked("-", uint256(-value).toString()));
+        if (value >= 0) {
+            return uint256(value).toString();
+        } else {
+            return string(abi.encodePacked("-", uint256(-value).toString()));
+        }
     }
-}
 
     /// Produce a simple SVG representing the position:
     /// - top: textual metadata,
@@ -451,7 +531,8 @@ contract Unibow is BaseHook, ERC721 {
 
         // Colors and simple layout
         string memory title = string(abi.encodePacked("Unibow LP #", tokenId.toString()));
-        string memory ticks = string(abi.encodePacked("Ticks: ", intToString(pos.tickLower), " / ", intToString(pos.tickUpper)));
+        string memory ticks =
+            string(abi.encodePacked("Ticks: ", intToString(pos.tickLower), " / ", intToString(pos.tickUpper)));
         string memory liqText = string(abi.encodePacked("Liquidity: ", uint256(pos.liquidity).toString()));
         string memory unlockText = string(abi.encodePacked("Unlock: ", pos.unlockTime.toString()));
 
@@ -459,35 +540,37 @@ contract Unibow is BaseHook, ERC721 {
         string memory svg = string(
             abi.encodePacked(
                 '<svg xmlns="http://www.w3.org/2000/svg" width="520" height="220" viewBox="0 0 520 220">',
-                    '<style>',
-                        'text{font-family:Arial,sans-serif;fill:#111;font-size:14px;}',
-                        '.title{font-size:16px;font-weight:600;}',
-                        '.muted{font-size:12px;fill:#666;}',
-                    '</style>',
-
-                    // background
-                    '<rect width="100%" height="100%" fill="#f8fafc" rx="12" />',
-
-                    // title
-                    '<text x="20" y="30" class="title">', title, '</text>',
-
-                    // liquidity text
-                    '<text x="20" y="60">', liqText, '</text>',
-
-                    // bar background
-                    '<rect x="20" y="75" width="400" height="24" rx="6" fill="#e6e9ef"/>',
-
-                    // bar fill
-                    '<rect x="20" y="75" width="', uint2str(barWidth), '" height="24" rx="6" fill="#4f46e5"/>',
-
-                    // ticks and unlock
-                    '<text x="20" y="115" class="muted">', ticks, '</text>',
-                    '<text x="20" y="135" class="muted">', unlockText, '</text>',
-
-                    // small footer
-                    '<text x="20" y="195" class="muted">Unibow - on-chain position</text>',
-
-                '</svg>'
+                "<style>",
+                "text{font-family:Arial,sans-serif;fill:#111;font-size:14px;}",
+                ".title{font-size:16px;font-weight:600;}",
+                ".muted{font-size:12px;fill:#666;}",
+                "</style>",
+                // background
+                '<rect width="100%" height="100%" fill="#f8fafc" rx="12" />',
+                // title
+                '<text x="20" y="30" class="title">',
+                title,
+                "</text>",
+                // liquidity text
+                '<text x="20" y="60">',
+                liqText,
+                "</text>",
+                // bar background
+                '<rect x="20" y="75" width="400" height="24" rx="6" fill="#e6e9ef"/>',
+                // bar fill
+                '<rect x="20" y="75" width="',
+                uint2str(barWidth),
+                '" height="24" rx="6" fill="#4f46e5"/>',
+                // ticks and unlock
+                '<text x="20" y="115" class="muted">',
+                ticks,
+                "</text>",
+                '<text x="20" y="135" class="muted">',
+                unlockText,
+                "</text>",
+                // small footer
+                '<text x="20" y="195" class="muted">Unibow - on-chain position</text>',
+                "</svg>"
             )
         );
 

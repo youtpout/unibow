@@ -79,33 +79,17 @@ contract UnibowTest is Test, Deployers {
             liquidityAmount
         );
 
-        IERC20( Currency.unwrap(currency0)).approve(address(hook), type(uint256).max);
-        IERC20( Currency.unwrap(currency1)).approve(address(hook), type(uint256).max);
-        (tokenId,) = hook.addLiquidity(
-            poolKey,
-            tickLower,
-            tickUpper,
-            100e18,
-            150e18,
-            lp           
-        );
+        IERC20(Currency.unwrap(currency0)).approve(address(hook), type(uint256).max);
+        IERC20(Currency.unwrap(currency1)).approve(address(hook), type(uint256).max);
+        (tokenId,) = hook.addLiquidity(poolKey, tickLower, tickUpper, 100e18, 150e18, lp);
     }
 
     function testMintFails() public {
         vm.expectRevert();
         positionManager.mint(
-            poolKey,
-            -120,
-            120,
-            1e18,
-            type(uint256).max,
-            type(uint256).max,
-            address(this),
-            block.timestamp,
-            ""
+            poolKey, -120, 120, 1e18, type(uint256).max, type(uint256).max, address(this), block.timestamp, ""
         );
     }
-
 
     function testLpCannotWithdrawBeforeUnlockButCanRebalance() public {
         // LP a une position active (créée dans setUp)
