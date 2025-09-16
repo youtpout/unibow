@@ -50,7 +50,7 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
     using CurrencyLibrary for Currency;
     using CurrencySettler for Currency;
 
-    uint256 public constant BASIS = 100_000; // bps scale
+    uint256 public constant BASIS = 1_000_000; // bps scale
 
     // For visual scaling of liquidity bar in SVG
     uint256 public constant VISUAL_LIQUIDITY_CAP = 1e18; // cap used to scale the bar width
@@ -181,7 +181,9 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
         amountOut = (totalOut * borrowableRatioBP) / BASIS;
         require(amountOut >= amountOutMin, InsufficientOutputAmount());
         uint256 amountLiquidity = totalOut - amountOut;
-        uint256 collateralAmount = amountIn - (amountIn * feeBorrowBP) / BASIS;
+        console.log("amountIn",amountIn);
+        uint256 collateralAmount = amountIn - (amountIn * feeBorrowBP) / BASIS;        
+        console.log("collateralAmount",collateralAmount);
         require(collateralAmount < amountIn, WrongCollateralCalculation());
 
         PoolId poolId = key.toId();
