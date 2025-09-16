@@ -6,7 +6,7 @@ import {Test, console} from "forge-std/Test.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
-import {IPoolManager,ModifyLiquidityParams} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {IPoolManager, ModifyLiquidityParams} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
@@ -54,7 +54,7 @@ contract UnibowTest is Test, Deployers {
         address flags = address(
             uint160(
                 Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG
-                    | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG
+                    | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG
             ) ^ (0x4444 << 144)
         );
 
@@ -110,10 +110,32 @@ contract UnibowTest is Test, Deployers {
 
         console.log("bal0", bal0);
         console.log("bal1", bal1);
+        console.log("addressthis", address(this));
+        console.log("router", address(swapRouter));
 
-        // Remboursement dans la fenêtre
-        vm.prank(borrower);
-        hook.repayLoan(loanId);
+        // reimbourse on swap
+        (,,,,, bool zeroForOne,,, uint128 collateralAmount, uint128 borrowAmount) = hook.positions(loanId);
+        //deal(Currency.unwrap(zeroForOne ? currency0 : currency1), borrower, borrowAmount);
+
+     
+       // vm.startPrank(borrower);
+       // IERC20(Currency.unwrap(currency0)).approve(address(swapRouter), type(uint256).max);
+        swapRouter.swapExactTokensForTokens({
+            amountIn: borrowAmount,
+            amountOutMin: collateralAmount,
+            zeroForOne: !zeroForOne,
+            poolKey: poolKey,
+            hookData: abi.encode(Unibow.BorrowData({borrower: borrower, isBorrow: false, tokenId: loanId})),
+            receiver: borrower,
+            deadline: block.timestamp + 1
+        });
+        vm.stopPrank();
+
+            bal0 = IERC20(Currency.unwrap(currency0)).balanceOf(borrower);
+         bal1 = IERC20(Currency.unwrap(currency1)).balanceOf(borrower);
+
+        console.log("bal0", bal0);
+        console.log("bal1", bal1);
     }
 
     // function testLoanDefaultAfterExpiration() public {
