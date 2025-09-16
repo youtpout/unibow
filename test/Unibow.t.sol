@@ -115,11 +115,12 @@ contract UnibowTest is Test, Deployers {
 
         // reimbourse on swap
         (,,,,, bool zeroForOne,,, uint128 collateralAmount, uint128 borrowAmount) = hook.positions(loanId);
-        //deal(Currency.unwrap(zeroForOne ? currency0 : currency1), borrower, borrowAmount);
+        deal(Currency.unwrap(currency0), borrower, borrowAmount);
+        deal(Currency.unwrap(currency1), borrower, borrowAmount);
 
-     
-       // vm.startPrank(borrower);
-       // IERC20(Currency.unwrap(currency0)).approve(address(swapRouter), type(uint256).max);
+        vm.startPrank(borrower);
+        IERC20(Currency.unwrap(currency0)).approve(address(swapRouter), type(uint256).max);
+        IERC20(Currency.unwrap(currency1)).approve(address(swapRouter), type(uint256).max);
         swapRouter.swapExactTokensForTokens({
             amountIn: borrowAmount,
             amountOutMin: collateralAmount,
@@ -131,8 +132,8 @@ contract UnibowTest is Test, Deployers {
         });
         vm.stopPrank();
 
-            bal0 = IERC20(Currency.unwrap(currency0)).balanceOf(borrower);
-         bal1 = IERC20(Currency.unwrap(currency1)).balanceOf(borrower);
+        bal0 = IERC20(Currency.unwrap(currency0)).balanceOf(borrower);
+        bal1 = IERC20(Currency.unwrap(currency1)).balanceOf(borrower);
 
         console.log("bal0", bal0);
         console.log("bal1", bal1);

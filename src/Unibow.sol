@@ -418,7 +418,7 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
                 console.log("owner", ownerOf(tokenId));
                 console.log("sender", sender);
                 console.log("tx.origin", tx.origin);
-                  
+
                 // todo: not secure use user signature in the future
                 require(ownerOf(tokenId) == bd.borrower, "Not NFT owner");
                 LPPosition storage lp = positions[tokenId];
@@ -427,9 +427,10 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
 
                 uint24 zeroFee = 0 | LPFeeLibrary.OVERRIDE_FEE_FLAG;
 
-                uint256 amountIn= params.amountSpecified > 0 ?
-                    uint256(int256(params.amountSpecified)) : uint256(int256(-params.amountSpecified));
-       console.log("amountIn", amountIn);
+                uint256 amountIn = params.amountSpecified > 0
+                    ? uint256(int256(params.amountSpecified))
+                    : uint256(int256(-params.amountSpecified));
+                console.log("amountIn", amountIn);
                 require(params.zeroForOne != lp.zeroForOne, "Wrong repay token");
                 require(amountIn == lp.borrowAmount, "Not enough to repay");
 
@@ -454,7 +455,7 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
                 delete positions[tokenId];
                 _burn(tokenId);
 
-                if (params.zeroForOne) {                   
+                if (params.zeroForOne) {
                     key.currency0.take(poolManager, address(this), lp.borrowAmount, true);
                     key.currency1.settle(poolManager, address(this), lp.collateralAmount, true);
                 } else {
