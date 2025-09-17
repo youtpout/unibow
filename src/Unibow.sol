@@ -130,7 +130,7 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
             afterSwap: false,
             beforeDonate: false,
             afterDonate: false,
-            beforeSwapReturnDelta: true,
+            beforeSwapReturnDelta: false,
             afterSwapReturnDelta: false,
             afterAddLiquidityReturnDelta: false,
             afterRemoveLiquidityReturnDelta: false
@@ -148,6 +148,15 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
         return feeClassicBP;
     }
 
+    /// @notice Initiates a borrow operation by performing a swap through the specified router.
+    /// @param swapRouter The address of the swap router to execute the swap.
+    /// @param key The pool key defining the token pair and fee structure for the swap.
+    /// @param amountIn The amount of input tokens to provide for the swap.
+    /// @param amountOutMin The minimum acceptable amount of output tokens to receive from the swap.
+    /// @param zeroForOne A boolean indicating the direction of the swap; true if swapping token0 for token1. (true = token0 is collateral)
+    /// @param recipient The address that will receive the borrowed tokens.
+    /// @return tokenId The unique identifier of the liquidity position NFT created for the collateral.
+    /// @return amountOut The actual amount of tokens received from the swap after fees.
     function loan(
         address swapRouter,
         PoolKey calldata key,
@@ -157,9 +166,11 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
         address recipient
     ) external returns (uint256 tokenId, uint256 amountOut) {
         if (zeroForOne) {
+            console.log("collateral is token 0");
             IERC20(Currency.unwrap(key.currency0)).transferFrom(msg.sender, address(this), amountIn);
             IERC20(Currency.unwrap(key.currency0)).approve(swapRouter, amountIn);
         } else {
+            console.log("collateral is token 1");
             IERC20(Currency.unwrap(key.currency1)).transferFrom(msg.sender, address(this), amountIn);
             IERC20(Currency.unwrap(key.currency1)).approve(swapRouter, amountIn);
         }
@@ -181,9 +192,9 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
         amountOut = (totalOut * borrowableRatioBP) / BASIS;
         require(amountOut >= amountOutMin, InsufficientOutputAmount());
         uint256 amountLiquidity = totalOut - amountOut;
-        console.log("amountIn",amountIn);
-        uint256 collateralAmount = amountIn - (amountIn * feeBorrowBP) / BASIS;        
-        console.log("collateralAmount",collateralAmount);
+        console.log("amountIn", amountIn);
+        uint256 collateralAmount = amountIn - (amountIn * feeBorrowBP) / BASIS;
+        console.log("collateralAmount", collateralAmount);
         require(collateralAmount < amountIn, WrongCollateralCalculation());
 
         PoolId poolId = key.toId();
@@ -195,8 +206,9 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
 
         uint128 poolLiquidity = StateLibrary.getLiquidity(poolManager, poolId);
 
+        // create lower tick to add all liquidity
         int24 tickLower = TickMath.minUsableTick(key.tickSpacing);
-        int24 tickUpper = TickMath.maxUsableTick(key.tickSpacing);
+        int24 tickUpper = ((currentTick - key.tickSpacing * 2) / key.tickSpacing) * key.tickSpacing;
 
         uint160 sqrtPriceLower = TickMath.getSqrtPriceAtTick(tickLower);
         uint160 sqrtPriceUpper = TickMath.getSqrtPriceAtTick(tickUpper);
@@ -210,12 +222,12 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
         ModifyLiquidityParams memory params = ModifyLiquidityParams({
             tickLower: tickLower,
             tickUpper: tickUpper,
-            liquidityDelta: int256(amountLiquidity),
+            liquidityDelta: int256(uint256(liquidity)),
             salt: 0
         });
 
         // Call through unlock mechanism
-        _modifyLiquidity(msg.sender, key, params);
+        _modifyLiquidity(address(this), key, params);
 
         positions[tokenId] = LPPosition({
             key: key,
@@ -226,7 +238,7 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
             exists: true,
             zeroForOne: zeroForOne,
             borrowMaturity: uint32(block.timestamp + borrowRepayWindow),
-            borrowAmount: uint128(totalOut),
+            borrowAmount: uint128(amountOut),
             collateralAmount: uint128(collateralAmount)
         });
 
@@ -239,6 +251,15 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
         }
     }
 
+    function reimbourse(uint256 tokenId) external {
+        LPPosition storage lp = positions[tokenId];
+
+        lp.key.currency0.settle(poolManager, msg.sender, lp.borrowAmount, false);
+
+        // Donner token1 au borrower (take = recevoir du PoolManager)
+        lp.key.currency1.take(poolManager, msg.sender, lp.collateralAmount, false);
+    }
+
     // lock liquidity for 3 months
     function addLiquidity(
         PoolKey calldata key,
@@ -247,7 +268,7 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
         uint256 amount0Desired,
         uint256 amount1Desired,
         address recipient
-    ) external returns (uint256 tokenId, uint128 liquidity) {
+    ) public returns (uint256 tokenId, uint128 liquidity) {
         PoolId poolId = key.toId();
         (uint160 sqrtPriceX96,,,) = StateLibrary.getSlot0(poolManager, poolId);
 
@@ -413,63 +434,8 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
         if (data.length > 0) {
             bd = abi.decode(data, (BorrowData));
             isBorrow = bd.isBorrow;
-
-            if (!isBorrow && bd.tokenId > 0) {
-                uint256 tokenId = bd.tokenId;
-                console.log("tokenId", tokenId);
-                console.log("owner", ownerOf(tokenId));
-                console.log("sender", sender);
-                console.log("tx.origin", tx.origin);
-
-                // todo: not secure use user signature in the future
-                require(ownerOf(tokenId) == bd.borrower, "Not NFT owner");
-                LPPosition storage lp = positions[tokenId];
-                require(lp.collateralAmount > 0, "invalid loan");
-                require(block.timestamp <= lp.borrowMaturity, "repay window closed");
-
-                uint24 zeroFee = 0 | LPFeeLibrary.OVERRIDE_FEE_FLAG;
-
-                uint256 amountIn = params.amountSpecified > 0
-                    ? uint256(int256(params.amountSpecified))
-                    : uint256(int256(-params.amountSpecified));
-                console.log("amountIn", amountIn);
-                require(params.zeroForOne != lp.zeroForOne, "Wrong repay token");
-                require(amountIn == lp.borrowAmount, "Not enough to repay");
-
-                BeforeSwapDelta beforeSwapDelta = toBeforeSwapDelta(
-                    int128(-params.amountSpecified), // So `specifiedAmount` = +100
-                    int128(lp.collateralAmount) // Unspecified amount (output delta) = -100
-                );
-
-                // Use unlock pattern instead of direct modifyLiquidity call
-                ModifyLiquidityParams memory paramsLiquidity = ModifyLiquidityParams({
-                    tickLower: lp.tickLower,
-                    tickUpper: lp.tickUpper,
-                    liquidityDelta: -int128(lp.liquidity),
-                    salt: 0
-                });
-
-                // Call through unlock mechanism
-                //_modifyLiquidity(address(this), lp.key, paramsLiquidity);
-
-                poolManager.modifyLiquidity(key, paramsLiquidity, ZERO_BYTES);
-
-                delete positions[tokenId];
-                _burn(tokenId);
-
-                if (params.zeroForOne) {
-                    key.currency0.take(poolManager, address(this), lp.borrowAmount, true);
-                    key.currency1.settle(poolManager, address(this), lp.collateralAmount, true);
-                } else {
-                    key.currency0.settle(poolManager, address(this), lp.borrowAmount, true);
-                    key.currency1.take(poolManager, address(this), lp.collateralAmount, true);
-                }
-                return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, zeroFee);
-            }
         }
-
         uint24 fee = _getFee(isBorrow, false) | LPFeeLibrary.OVERRIDE_FEE_FLAG;
-
         return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, fee);
     }
 

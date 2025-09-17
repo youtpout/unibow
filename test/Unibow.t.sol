@@ -54,7 +54,7 @@ contract UnibowTest is Test, Deployers {
         address flags = address(
             uint160(
                 Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG
-                    | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG
+                    | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG
             ) ^ (0x4444 << 144)
         );
 
@@ -82,6 +82,12 @@ contract UnibowTest is Test, Deployers {
         IERC20(Currency.unwrap(currency0)).approve(address(hook), type(uint256).max);
         IERC20(Currency.unwrap(currency1)).approve(address(hook), type(uint256).max);
         (tokenId,) = hook.addLiquidity(poolKey, tickLower, tickUpper, 100e18, 150e18, lp);
+
+        uint256 bal0 = IERC20(Currency.unwrap(currency0)).balanceOf(address(hook));
+        uint256 bal1 = IERC20(Currency.unwrap(currency1)).balanceOf(address(hook));
+
+        console.log("bal0 hook 0", bal0);
+        console.log("bal1 hook 0", bal1);
     }
 
     function testMintFails() public {
@@ -110,13 +116,17 @@ contract UnibowTest is Test, Deployers {
 
         console.log("bal0", bal0);
         console.log("bal1", bal1);
-        console.log("addressthis", address(this));
-        console.log("router", address(swapRouter));
+
+        bal0 = IERC20(Currency.unwrap(currency0)).balanceOf(address(hook));
+        bal1 = IERC20(Currency.unwrap(currency1)).balanceOf(address(hook));
+
+        console.log("bal0 hook", bal0);
+        console.log("bal1 hook", bal1);
 
         // reimbourse on swap
         (,,,,, bool zeroForOne,,, uint128 collateralAmount, uint128 borrowAmount) = hook.positions(loanId);
         deal(Currency.unwrap(currency1), borrower, borrowAmount);
-        //deal(Currency.unwrap(currency1), borrower, borrowAmount);
+        deal(Currency.unwrap(currency1), borrower, borrowAmount);
 
         vm.startPrank(borrower);
         bal0 = IERC20(Currency.unwrap(currency0)).balanceOf(borrower);
@@ -127,15 +137,16 @@ contract UnibowTest is Test, Deployers {
         IERC20(Currency.unwrap(currency1)).approve(address(swapRouter), type(uint256).max);
         console.log("borrowAmount", borrowAmount);
         console.log("collateralAmount", collateralAmount);
-        swapRouter.swapExactTokensForTokens({
-            amountIn: borrowAmount,
-            amountOutMin: collateralAmount,
-            zeroForOne: !zeroForOne,
-            poolKey: poolKey,
-            hookData: abi.encode(Unibow.BorrowData({borrower: borrower, isBorrow: false, tokenId: loanId})),
-            receiver: borrower,
-            deadline: block.timestamp + 1
-        });
+        // swapRouter.swapExactTokensForTokens({
+        //     amountIn: borrowAmount,
+        //     amountOutMin: collateralAmount,
+        //     zeroForOne: !zeroForOne,
+        //     poolKey: poolKey,
+        //     hookData: abi.encode(Unibow.BorrowData({borrower: borrower, isBorrow: false, tokenId: loanId})),
+        //     receiver: borrower,
+        //     deadline: block.timestamp + 1
+        // });
+        hook.reimbourse(tokenId);
         vm.stopPrank();
 
         bal0 = IERC20(Currency.unwrap(currency0)).balanceOf(borrower);
