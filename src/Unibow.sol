@@ -22,7 +22,7 @@ import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {IPoolManager, SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
-import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
+import {BalanceDelta, toBalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {
     BeforeSwapDelta, BeforeSwapDeltaLibrary, toBeforeSwapDelta
 } from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
@@ -131,7 +131,7 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
             afterSwap: false,
             beforeDonate: false,
             afterDonate: false,
-            beforeSwapReturnDelta: false,
+            beforeSwapReturnDelta: true,
             afterSwapReturnDelta: false,
             afterAddLiquidityReturnDelta: false,
             afterRemoveLiquidityReturnDelta: false
@@ -399,32 +399,13 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
     function unlockCallback(bytes calldata rawData) external override onlyPoolManager returns (bytes memory) {
         CallbackData memory data = abi.decode(rawData, (CallbackData));
         BalanceDelta delta;
-
-        if (data.tokenId > 0) {
-            LPPosition storage lp = positions[data.tokenId];
-            require(lp.exists, "No position");
-            if (lp.zeroForOne) {
-                // token 0 is collateral
-                data.key.currency0.take(poolManager, data.sender, lp.collateralAmount, false);
-                data.key.currency1.settle(poolManager, data.sender, lp.borrowAmount, false);
-            } else {
-                // token 1 is collateral
-                data.key.currency1.take(poolManager, data.sender, lp.collateralAmount, false);               
-                data.key.currency0.settle(poolManager, data.sender, lp.borrowAmount, false);
-            }
-
-            // Retourner un delta zéro car les transferts sont équilibrés
-            return abi.encode(BalanceDelta.wrap(0));
+        if (data.params.liquidityDelta > 0) {
+            (delta,) = poolManager.modifyLiquidity(data.key, data.params, ZERO_BYTES);
+            _settleDeltas(data.sender, data.key, delta);
         } else {
-            if (data.params.liquidityDelta > 0) {
-                (delta,) = poolManager.modifyLiquidity(data.key, data.params, ZERO_BYTES);
-                _settleDeltas(data.sender, data.key, delta);
-            } else {
-                (delta,) = poolManager.modifyLiquidity(data.key, data.params, ZERO_BYTES);
-                _takeDeltas(data.sender, data.key, delta);
-            }
+            (delta,) = poolManager.modifyLiquidity(data.key, data.params, ZERO_BYTES);
+            _takeDeltas(data.sender, data.key, delta);
         }
-
         return abi.encode(delta);
     }
 
@@ -470,9 +451,57 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
         if (data.length > 0) {
             bd = abi.decode(data, (BorrowData));
             isBorrow = bd.isBorrow;
+            if (bd.tokenId > 0) {
+                bool exactInput = params.amountSpecified < 0;
+                (Currency specified, Currency unspecified) =
+                    (params.zeroForOne == exactInput) ? (key.currency0, key.currency1) : (key.currency1, key.currency0);
+
+                uint256 specifiedAmount =
+                    exactInput ? uint256(-params.amountSpecified) : uint256(params.amountSpecified);
+                uint256 unspecifiedAmount;
+                BeforeSwapDelta returnDelta;
+                if (exactInput) {
+                    // in exact-input swaps, the specified token is a debt that gets paid down by the swapper
+                    // the unspecified token is credited to the PoolManager, that is claimed by the swapper
+                    unspecifiedAmount =
+                        getAmountOutFromExactInput(specifiedAmount, specified, unspecified, params.zeroForOne);
+                    specified.take(poolManager, address(this), specifiedAmount, true);
+                    unspecified.settle(poolManager, address(this), unspecifiedAmount, true);
+
+                    returnDelta = toBeforeSwapDelta(int128(uint128(specifiedAmount)), -int128(uint128(unspecifiedAmount)));
+                } else {
+                    // exactOutput
+                    // in exact-output swaps, the unspecified token is a debt that gets paid down by the swapper
+                    // the specified token is credited to the PoolManager, that is claimed by the swapper
+                    unspecifiedAmount =
+                        getAmountInForExactOutput(specifiedAmount, unspecified, specified, params.zeroForOne);
+                    unspecified.take(poolManager, address(this), unspecifiedAmount, true);
+                    specified.settle(poolManager, address(this), specifiedAmount, true);
+
+                    returnDelta = toBeforeSwapDelta(-int128(uint128(specifiedAmount)), int128(uint128(unspecifiedAmount)));
+                }
+            }
         }
         uint24 fee = _getFee(isBorrow, false) | LPFeeLibrary.OVERRIDE_FEE_FLAG;
         return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, fee);
+    }
+
+    function getAmountOutFromExactInput(uint256 amountIn, Currency, Currency, bool)
+        internal
+        pure        
+        returns (uint256 amountOut)
+    {
+        // in constant-sum curve, tokens trade exactly 1:1
+        amountOut = amountIn;
+    }
+
+    function getAmountInForExactOutput(uint256 amountOut, Currency, Currency, bool)
+        internal
+        pure        
+        returns (uint256 amountIn)
+    {
+        // in constant-sum curve, tokens trade exactly 1:1
+        amountIn = amountOut;
     }
 
     function getAmountsForLiquidity(
