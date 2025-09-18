@@ -134,7 +134,8 @@ contract UnibowTest is Test, Deployers {
 
         console.log("bal0", bal0);
         console.log("bal1", bal1);
-        IERC20(Currency.unwrap(currency1)).approve(address(swapRouter), type(uint256).max);
+        IERC20(Currency.unwrap(currency0)).approve(address(hook), type(uint256).max);
+        IERC20(Currency.unwrap(currency1)).approve(address(hook), type(uint256).max);
         console.log("borrowAmount", borrowAmount);
         console.log("collateralAmount", collateralAmount);
         // swapRouter.swapExactTokensForTokens({
@@ -146,7 +147,7 @@ contract UnibowTest is Test, Deployers {
         //     receiver: borrower,
         //     deadline: block.timestamp + 1
         // });
-        hook.reimbourse(tokenId);
+        hook.reimbourse(loanId);
         vm.stopPrank();
 
         bal0 = IERC20(Currency.unwrap(currency0)).balanceOf(borrower);

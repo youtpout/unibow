@@ -95,6 +95,7 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
         address sender;
         PoolKey key;
         ModifyLiquidityParams params;
+        uint256 tokenId;
     }
 
     // encoded swap data for borrow
@@ -252,12 +253,28 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
     }
 
     function reimbourse(uint256 tokenId) external {
+        require(ownerOf(tokenId) == msg.sender, "Not NFT owner");
+
         LPPosition storage lp = positions[tokenId];
+        require(lp.exists, "Position does not exist");
+        require(block.timestamp <= lp.borrowMaturity, "Loan expired");
 
-        lp.key.currency0.settle(poolManager, msg.sender, lp.borrowAmount, false);
+        PoolKey memory key = lp.key;
 
-        // Donner token1 au borrower (take = recevoir du PoolManager)
-        lp.key.currency1.take(poolManager, msg.sender, lp.collateralAmount, false);
+        // Préparer les données pour le custom swap
+        CallbackData memory swapData = CallbackData({
+            sender: msg.sender,
+            key: key,
+            params: ModifyLiquidityParams(0, 0, 0, 0), // Pas de modification de liquidité
+            tokenId: tokenId
+        });
+
+        // Exécuter le custom swap via unlock
+        poolManager.unlock(abi.encode(swapData));
+
+        // Nettoyer la position après le swap
+        delete positions[tokenId];
+        _burn(tokenId);
     }
 
     // lock liquidity for 3 months
@@ -383,13 +400,31 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
         CallbackData memory data = abi.decode(rawData, (CallbackData));
         BalanceDelta delta;
 
-        if (data.params.liquidityDelta > 0) {
-            (delta,) = poolManager.modifyLiquidity(data.key, data.params, ZERO_BYTES);
-            _settleDeltas(data.sender, data.key, delta);
+        if (data.tokenId > 0) {
+            LPPosition storage lp = positions[data.tokenId];
+            require(lp.exists, "No position");
+            if (lp.zeroForOne) {
+                // token 0 is collateral
+                data.key.currency0.take(poolManager, data.sender, lp.collateralAmount, false);
+                data.key.currency1.settle(poolManager, data.sender, lp.borrowAmount, false);
+            } else {
+                // token 1 is collateral
+                data.key.currency1.take(poolManager, data.sender, lp.collateralAmount, false);               
+                data.key.currency0.settle(poolManager, data.sender, lp.borrowAmount, false);
+            }
+
+            // Retourner un delta zéro car les transferts sont équilibrés
+            return abi.encode(BalanceDelta.wrap(0));
         } else {
-            (delta,) = poolManager.modifyLiquidity(data.key, data.params, ZERO_BYTES);
-            _takeDeltas(data.sender, data.key, delta);
+            if (data.params.liquidityDelta > 0) {
+                (delta,) = poolManager.modifyLiquidity(data.key, data.params, ZERO_BYTES);
+                _settleDeltas(data.sender, data.key, delta);
+            } else {
+                (delta,) = poolManager.modifyLiquidity(data.key, data.params, ZERO_BYTES);
+                _takeDeltas(data.sender, data.key, delta);
+            }
         }
+
         return abi.encode(delta);
     }
 
@@ -401,7 +436,8 @@ contract Unibow is BaseHook, ERC721, IUnlockCallback {
         internal
         returns (BalanceDelta delta)
     {
-        delta = abi.decode(poolManager.unlock(abi.encode(CallbackData(sender, key, params))), (BalanceDelta));
+        SwapParams memory paramsZero = SwapParams({zeroForOne: false, amountSpecified: 0, sqrtPriceLimitX96: 0});
+        delta = abi.decode(poolManager.unlock(abi.encode(CallbackData(sender, key, params, 0))), (BalanceDelta));
     }
 
     /// @notice Settles any owed balances after liquidity modification.
